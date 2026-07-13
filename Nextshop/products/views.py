@@ -1,115 +1,154 @@
+from django.db.models import Q, Count, Avg, F
+from django.http import JsonResponse
+from django.shortcuts import get_object_or_404
+from django.views import View
+from django.views.decorators.csrf import csrf_exempt
+from django.utils.decorators import method_decorator
+from rest_framework import generics, status, filters
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated, IsAdminUser, AllowAny
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.pagination import PageNumberPagination
 import json
 
-from django.http import JsonResponse
-from django.views import View
+from.models import Product, ProductVariant, Category, Brand
+from.serializers import (
+    ProductSerializer, ProductListSerializer, ProductDetailSerializer,
+    ProductCreateSerializer, VariantSerializer, CategorySerializer, BrandSerializer
+)
 
-from .models import Product, ProductVariant
+# ====== CONSTANTS - L19 LEVEL DICTIONARY/TUPLE ======
+API_RESPONSE_CODES = {
+    'SUCCESS': 200,
+    'CREATED': 201,
+    'BAD_REQUEST': 400,
+    'NOT_FOUND': 404,
+    'SERVER_ERROR': 500,
+}
 
+SORT_OPTIONS = (
+    ('newest', '-created_at'),
+    ('oldest', 'created_at'),
+    ('price_low', 'price'),
+    ('price_high', '-price'),
+    ('popular', '-is_featured'),
+    ('name_az', 'name'),
+)
 
-class ProductListAPIView(View):
+FILTER_OPTIONS = {
+    'status': ['draft', 'published', 'archived'],
+    'stock_status': ['in_stock', 'out_of_stock', 'pre_order', 'back_order'],
+    'currency': ['BDT', 'USD'],
+}
 
-    def get(self, request):
+ERROR_MESSAGES = {
+    'PRODUCT_NOT_FOUND': 'Product not found',
+    'INVALID_DATA': 'Invalid data provided',
+    'STOCK_UNAVAILABLE': 'Product out of stock',
+    'SERVER_ERROR': 'Internal server error',
+}
 
-        products = Product.objects.filter(
-            status="active"
-        )
+SUCCESS_MESSAGES = {
+    'PRODUCT_CREATED': 'Product created successfully',
+    'PRODUCT_UPDATED': 'Product updated successfully',
+    'PRODUCT_DELETED': 'Product deleted successfully',
+}
 
-        results = tuple(
-            {
-                "id": p.id,
-                "name": p.name,
-                "slug": p.slug,
-                "sku": p.sku,
-                "price": str(p.price),
-                "sale_price": str(p.sale_price),
-                "discount_price": str(p.discount_price) 
-                if p.discount_price else None,
-                "stock": p.stock,
-                "stock": p.stock_quantity,
-                "featured": p.is_featured,
-            }
-            for p in products
-        )
+# ====== PAGINATION ======
+class StandardResultsSetPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 100
 
-        return JsonResponse(
-            {
-                "success": True,
-                "results": results,
-            }
-        )
+# ====== API 1: PRODUCT LIST WITH FILTER + SEARCH + SORT ======
+class ProductListAPIView(generics.ListAPIView):
+    """
+    L19: Advanced filtering, searching, sorting, pagination
+    GET /api/products/?category=1&price_min=100&sort=price_low&search=iphone
+    """
+    permission_classes = [AllowAny]
+    pagination_class = StandardResultsSetPagination
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['name', 'description', 'short_description', 'brand__name', 'category__name']
+    ordering_fields = ['price', 'created_at', 'name', 'stock']
 
+    def get_serializer_class(self):
+        return ProductListSerializer
 
-class ProductDetailAPIView(View):
+    def get_queryset(self):
+        queryset = Product.objects.filter(status='published', is_deleted=False).select_related('category', 'brand', 'seller').prefetch_related('variants')
 
-    def get(self, request, pk):
-
-        p = Product.objects.get(pk=pk)
-
-        data = {
-            "id": p.id,
-            "name": p.name,
-            "slug": p.slug,
-            "description": p.description,
-            "price": str(p.price),
-            "sale_price": str(p.sale_price),
-            "stock": p.stock_quantity,
-            "category_id": p.category_id,
+        # FILTER DICTIONARY LOGIC
+        filters_dict = {
+            'category_id': self.request.GET.get('category'),
+            'brand_id': self.request.GET.get('brand'),
+            'status': self.request.GET.get('status', 'published'),
+            'stock_status': self.request.GET.get('stock_status'),
+            'currency': self.request.GET.get('currency', 'BDT'),
+            'is_featured': self.request.GET.get('featured'),
         }
 
-        return JsonResponse(data)
+        for key, value in filters_dict.items():
+            if value:
+                queryset = queryset.filter(**{key: value})
 
+        # PRICE RANGE
+        price_min = self.request.GET.get('price_min')
+        price_max = self.request.GET.get('price_max')
+        if price_min:
+            queryset = queryset.filter(price__gte=price_min)
+        if price_max:
+            queryset = queryset.filter(price__lte=price_max)
 
-class ProductCreateAPIView(View):
+        # SORT LOGIC FROM TUPLE
+        sort = self.request.GET.get('sort', 'newest')
+        sort_dict = dict(SORT_OPTIONS)
+        if sort in sort_dict:
+            queryset = queryset.order_by(sort_dict[sort])
 
-    def post(self, request):
+        return queryset
 
-        payload = json.loads(
-            request.body.decode("utf-8")
-        )
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        return Response({
+            'success': True,
+            'code': API_RESPONSE_CODES['SUCCESS'],
+            'message': 'Products fetched successfully',
+            'filters_available': FILTER_OPTIONS,
+            'sort_options': [s[0] for s in SORT_OPTIONS],
+            'data': response.data
+        })
 
-        product = Product.objects.create(
-            name=payload["name"],
-            sku=payload["sku"],
-            price=payload["price"],
-            sale_price=payload.get("sale_price", 0),
-            stock_quantity=payload.get("stock_quantity", 0),
-            category_id=payload.get("category_id"),
-        )
+# ====== API 2: PRODUCT DETAIL ======
+class ProductDetailAPIView(generics.RetrieveAPIView):
+    permission_classes = [AllowAny]
 
-        return JsonResponse(
-            {
-                "success": True,
-                "product_id": product.id,
-            },
-            status=201
-        )
+    def get_serializer_class(self):
+        return ProductDetailSerializer
 
+    def get_queryset(self):
+        return Product.objects.filter(is_deleted=False).select_related('category', 'brand', 'seller').prefetch_related('variants')
 
-class ProductVariantListAPIView(View):
+    def retrieve(self, request, *args, **kwargs):
+        try:
+            instance = self.get_object()
+            serializer = self.get_serializer(instance)
+            return Response({
+                'success': True,
+                'code': API_RESPONSE_CODES['SUCCESS'],
+                'data': serializer.data
+            })
+        except Product.DoesNotExist:
+            return Response({
+                'success': False,
+                'code': API_RESPONSE_CODES['NOT_FOUND'],
+                'message': ERROR_MESSAGES['PRODUCT_NOT_FOUND']
+            }, status=status.HTTP_404_NOT_FOUND)
 
-    def get(self, request):
+# ====== API 3: PRODUCT CREATE ======
+class ProductCreateAPIView(generics.CreateAPIView):
+    permission_classes = [IsAuthenticated]
 
-        product_id = request.GET.get("product_id")
-
-        variants = ProductVariant.objects.filter(
-            product_id=product_id
-        )
-
-        results = tuple(
-            {
-                "id": v.id,
-                "name": v.name,
-                "sku": v.sku,
-                "price": str(v.price),
-                "stock": v.stock,
-                "attributes": v.attributes,
-            }
-            for v in variants
-        )
-
-        return JsonResponse(
-            {
-                "success": True,
-                "results": results,
-            }
-        )
+    def get_serializer_class(self):
+        return
