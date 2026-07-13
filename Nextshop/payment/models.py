@@ -1,4 +1,4 @@
-
+from django.contrib.auth import get_user_model
 from django.db import models
 from .constants import SUPPORTED_METHODS, TRANSACTION_STATUSES
 
@@ -15,7 +15,9 @@ class PaymentTransaction(models.Model):
     order_id = models.CharField(max_length=128, db_index=True)
     amount = models.DecimalField(max_digits=18, decimal_places=4)  # Crypto/Fiat high-precision
     currency = models.CharField(max_length=16, default="USD")
-    
+    User = get_user_model()
+    seller = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
+
     payment_method = models.CharField(
         max_length=64, 
         choices=METHOD_CHOICES, 
