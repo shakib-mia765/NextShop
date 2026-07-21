@@ -1,4 +1,4 @@
-# React + Vite+Django
+# React + Vite+Django repository map
 NextShop/
 │
 ├── Nextshop/
